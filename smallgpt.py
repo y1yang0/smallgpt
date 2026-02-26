@@ -1,5 +1,6 @@
 import tiktoken
 import torch
+import sys
 
 config = {
     "dataset": [
@@ -23,7 +24,7 @@ config = {
     "numLayer": 8,
     "maxWindowSize": 512,
     "dropoutRate": 0.0,
-    "learningRate": 3e-5,
+    "learningRate": 3e-4,
     "numEpoch": 1,
 }
 
@@ -197,22 +198,22 @@ class SmallGPT:
         print(f"@@    Total Parameters: {totalParams}")
         print(f"@@    Memory Usage: {totalParams * 4 / 1024 / 1024:.2f} MB")
 
-    def nextToken(self, input):
+    def nextToken(self, input, temperature=0.9):
         with torch.no_grad():
             logits = self.compute(input)
-        nextTokenId = logits[-1, :].argmax(dim=-1)
-        return nextTokenId.item()
+            logits = logits[-1, :] / temperature
+            probs = torch.softmax(logits, dim=-1)
+            nextTokenId = torch.multinomial(probs, num_samples=1)
+            return nextTokenId.item()
 
     def loadDataset(self):
         dataset = []
         for path in config["dataset"]:
             with open(path, "r", encoding="utf-8") as f:
-                txts = [line for line in f.read().splitlines() if line.strip()]
-                for txt in txts:
-                    tokens = torch.tensor(self.encode(txt))
-                    for i in range(0, len(tokens) - 1, self.maxWindowSize):
-                        chunk = tokens[i : i + self.maxWindowSize + 1]
-                        dataset.append((chunk[:-1], chunk[1:]))
+                tokens = torch.tensor(self.encode(f.read()))   
+                for i in range(0, len(tokens) - 1, self.maxWindowSize):
+                    chunk = tokens[i : i + self.maxWindowSize + 1]
+                    dataset.append((chunk[:-1], chunk[1:]))
         return dataset
 
     def train(self, numEpoch):
@@ -254,10 +255,13 @@ smallGPT = SmallGPT(
     config["dropoutRate"],
     config["learningRate"],
 )
-smallGPT.printConfig()
-smallGPT.load("smallgpt.bin")
-# smallGPT.train(config["numEpoch"])
-smallGPT.predict("比武的描写")
-smallGPT.predict("黄药")
-smallGPT.predict("小龙")
-smallGPT.predict("李莫")
+
+if len(sys.argv) > 1 and sys.argv[1] == "train":
+    smallGPT.printConfig()
+    smallGPT.train(config["numEpoch"])
+else:
+    smallGPT.load("smallgpt.bin")
+    smallGPT.predict("杨过和小龙女在")
+    smallGPT.predict("神雕大侠")
+    smallGPT.predict("韦小宝和双儿")
+    smallGPT.predict("围攻光明顶")

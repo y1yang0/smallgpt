@@ -2,6 +2,20 @@
 
 A minimal GPT implementation from scratch for learning purposes.
 
+# Quick Start
+
+```
+python smallgpt.py train
+```
+
+Train the model and save the weights to `smallgpt.bin`.
+
+```
+python smallgpt.py predict
+```
+
+Predict the (given sentence's) next token and print the result.
+
 ## Model Architecture
 
 ```
