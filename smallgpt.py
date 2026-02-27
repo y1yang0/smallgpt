@@ -22,6 +22,7 @@ config = {
     ],
     "dimEmb": 512,
     "numLayer": 8,
+    "numHead": 8,
     "maxWindowSize": 512,
     "dropoutRate": 0.0,
     "learningRate": 3e-4,
@@ -30,8 +31,8 @@ config = {
 
 
 class Normalization:
-    def __init__(self, dimEmb):
-        self.norm = torch.nn.LayerNorm(dimEmb)
+    def __init__(self, config):
+        self.norm = torch.nn.LayerNorm(config["dimEmb"])
 
     def compute(self, x):
         return self.norm(x)
@@ -44,7 +45,8 @@ class Normalization:
 
 
 class FeedForward:
-    def __init__(self, dimEmb):
+    def __init__(self, config):
+        dimEmb = config["dimEmb"]
         # up-project the input to a higher dimension so that the model can find
         # similar patterns in the data, non-linear activation function could
         # "turn on" or "turn off" certain patterns
@@ -67,51 +69,103 @@ class FeedForward:
 
 
 class Attention:
-    def __init__(self, dimEmb, dimOut, dropoutRate=config["dropoutRate"]):
-        self.dimOut = dimOut
+    def __init__(self, config):
+        dimEmb = config["dimEmb"]
+        self.numHead = config["numHead"]
         scale = dimEmb**-0.5
         self.wQuery = torch.nn.Parameter(
-            torch.randn(dimEmb, dimOut) * scale, requires_grad=True
+            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
         )
         self.wKey = torch.nn.Parameter(
-            torch.randn(dimEmb, dimOut) * scale, requires_grad=True
+            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
         )
         self.wValue = torch.nn.Parameter(
-            torch.randn(dimEmb, dimOut) * scale, requires_grad=True
+            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
         )
-        self.dropout = torch.nn.Dropout(dropoutRate)
+        self.wOut = torch.nn.Parameter(
+            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
+        )
+        self.dropout = torch.nn.Dropout(config["dropoutRate"])
+
 
     def parameters(self):
-        return [self.wQuery, self.wKey, self.wValue]
+        return [self.wQuery, self.wKey, self.wValue, self.wOut]
 
     def to(self, device):
-        self.wQuery.data = self.wQuery.data.to(device)
-        self.wKey.data = self.wKey.data.to(device)
-        self.wValue.data = self.wValue.data.to(device)
+        for p in self.parameters():
+            p.data = p.data.to(device)
 
     def compute(self, x):
+        # compute Q,K,V at once
         query = x @ self.wQuery
         key = x @ self.wKey
         value = x @ self.wValue
-        # attention socre means which tokens are most relevant to current token
+        # split Q,K,V into multiple heads, the underlying tensor is still the same
+        inputLen, dimEmb = x.shape
+        dimHead = dimEmb // self.numHead
+        # we want to split the tensor into numHead heads, each head has dimHead
+        # dimensions. If the tensor query(2x6) is as follows(numHead = 3, dimHead = 2)
+        # tensor([[ 0,  1,  2,  3,  4,  5],
+        #         [ 6,  7,  8,  9, 10, 11]])
+        # intuitively, the view shape is [numHead, inputLen, dimHead]
+        # >>> query.view(3,2,2)
+        # tensor([[[ 0,  1],
+        #          [ 2,  3]],
+        #         [[ 4,  5],
+        #          [ 6,  7]],
+        #         [[ 8,  9],
+        #          [10, 11]]])
+        # but actually, we want the following shape:
+        # tensor([[[ 0,  1],
+        #          [ 6,  7]],
+        #         [[ 2,  3],
+        #          [ 8,  9]],
+        #         [[ 4,  5],
+        #          [10, 11]]])
+        # so we view as [inputLen, numHead, dimHead]
+        # >>> query.view(2,3,2)
+        # tensor([[[ 0,  1],
+        #          [ 2,  3],
+        #          [ 4,  5]],
+        #         [[ 6,  7],
+        #          [ 8,  9],
+        #          [10, 11]]])
+        # and then transpose the first two dimensions to get the desired shape
+        queries = query.view(inputLen, self.numHead, dimHead).transpose(0, 1)
+        keys = key.view(inputLen, self.numHead, dimHead).transpose(0, 1)
+        values = value.view(inputLen, self.numHead, dimHead).transpose(0, 1)
         # Attention(Q,K,V) = softmax(mask(Q@K^T / sqrt(d_k))) @ V
-        mask = torch.tril(torch.ones(query.shape[0], query.shape[0], device=x.device))
-        attnScore = query @ key.T / (key.shape[-1] ** 0.5)
+        #
+        # attention socre means which tokens are most relevant to current token
+        # Q(numHead, inputLen, dimHead) @ K^T(numHead, dimHead, inputLen)
+        # = attnScore(numHead, inputLen, inputLen)
+        attnScore = queries @ keys.transpose(-2, -1) / (dimHead ** 0.5)
         # use causal mask to prevent the current token from seeing future tokens
+        # attnScore(numHead, inputLen, inputLen) @ mask(numHead, inputLen, inputLen)
+        # = maskedAttnScore(numHead, inputLen, inputLen)
+        mask = torch.tril(torch.ones(inputLen, inputLen, device=x.device))
         attnScore = attnScore.masked_fill(mask == 0, -torch.inf)
         # apply softmax to get the attention weights
         attnWeights = torch.softmax(attnScore, dim=-1)
         # apply dropout to prevent overfitting
         attnWeights = self.dropout(attnWeights)
-        return attnWeights @ value
+        # apply weights to the values to get the output
+        # (numHead, inputLen, inputLen) @ (numHead, inputLen, dimHead)
+        # = out(numHead, inputLen, dimHead)
+        out = attnWeights @ values
+        # merge all heads
+        out = out.transpose(0,1).contiguous().view(inputLen, dimEmb)
+        # use final projection to understand how to combine the information from all heads
+        return out @ self.wOut
+
 
 
 class Transformer:
-    def __init__(self, dimEmb, dropoutRate):
-        self.attn = Attention(dimEmb, dimEmb, dropoutRate)
-        self.norm1 = Normalization(dimEmb)
-        self.norm2 = Normalization(dimEmb)
-        self.ffn = FeedForward(dimEmb)
+    def __init__(self, config):
+        self.attn = Attention(config)
+        self.norm1 = Normalization(config)
+        self.norm2 = Normalization(config)
+        self.ffn = FeedForward(config)
 
     def compute(self, x):
         x = x + self.attn.compute(self.norm1.compute(x))
@@ -134,18 +188,20 @@ class Transformer:
 
 
 class SmallGPT:
-    def __init__(self, dimEmb, maxWindowSize, numLayer, dropoutRate, learningRate):
+    def __init__(self, config):
         torch.manual_seed(0xCAFEBABE)
+        dimEmb = config["dimEmb"]
+        maxWindowSize = config["maxWindowSize"]
         self.device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.maxWindowSize = maxWindowSize
         self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.n_vocab, dimEmb)
         self.posEmbedding = torch.nn.Embedding(maxWindowSize, dimEmb)
-        self.transformers = [Transformer(dimEmb, dropoutRate) for _ in range(numLayer)]
-        self.finalNorm = Normalization(dimEmb)
+        self.transformers = [Transformer(config) for _ in range(config["numLayer"])]
+        self.finalNorm = Normalization(config)
         self.out = torch.nn.Linear(dimEmb, self.tokenizer.n_vocab, bias=False)
         self.to(self.device)
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=learningRate)
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=config["learningRate"])
 
     def encode(self, input):
         return self.tokenizer.encode(input)
@@ -248,13 +304,7 @@ class SmallGPT:
         print(f"@@ Output: {self.decode(tokenIds)}")
 
 
-smallGPT = SmallGPT(
-    config["dimEmb"],
-    config["maxWindowSize"],
-    config["numLayer"],
-    config["dropoutRate"],
-    config["learningRate"],
-)
+smallGPT = SmallGPT(config)
 
 if len(sys.argv) > 1 and sys.argv[1] == "train":
     smallGPT.printConfig()
