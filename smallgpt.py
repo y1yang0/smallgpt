@@ -1,6 +1,8 @@
+from tokenizers import Tokenizer
 import tiktoken
 import torch
 import sys
+import random
 
 config = {
     "dataset": [
@@ -26,8 +28,38 @@ config = {
     "maxWindowSize": 512,
     "dropoutRate": 0.0,
     "learningRate": 3e-4,
-    "numEpoch": 1,
+    "numEpoch": 10,
 }
+
+
+# My first learned tokenizer
+class TiktokenTokenizer:
+    def __init__(self):
+        self.tokenizer = tiktoken.get_encoding("gpt2")
+
+    def decode(self, input):
+        return self.tokenizer.decode(input)
+
+    def encode(self, input):
+        return self.tokenizer.encode(input)
+
+    def vocabSize(self):
+        return self.tokenizer.n_vocab
+
+# Self-trained tokenizer for Jinyong-specific dataset, from huggingface/tokenizer
+class HuggingFaceTokenizer:
+    def __init__(self):
+        path = "data/tokenizer.json"
+        self.tokenizer = Tokenizer.from_file(path)
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids)
+
+    def encode(self, text):
+        return self.tokenizer.encode(text).ids
+
+    def vocabSize(self):
+        return self.tokenizer.get_vocab_size()
 
 
 class Normalization:
@@ -87,7 +119,6 @@ class Attention:
         )
         self.dropout = torch.nn.Dropout(config["dropoutRate"])
 
-
     def parameters(self):
         return [self.wQuery, self.wKey, self.wValue, self.wOut]
 
@@ -139,7 +170,7 @@ class Attention:
         # attention socre means which tokens are most relevant to current token
         # Q(numHead, inputLen, dimHead) @ K^T(numHead, dimHead, inputLen)
         # = attnScore(numHead, inputLen, inputLen)
-        attnScore = queries @ keys.transpose(-2, -1) / (dimHead ** 0.5)
+        attnScore = queries @ keys.transpose(-2, -1) / (dimHead**0.5)
         # use causal mask to prevent the current token from seeing future tokens
         # attnScore(numHead, inputLen, inputLen) @ mask(numHead, inputLen, inputLen)
         # = maskedAttnScore(numHead, inputLen, inputLen)
@@ -154,10 +185,9 @@ class Attention:
         # = out(numHead, inputLen, dimHead)
         out = attnWeights @ values
         # merge all heads
-        out = out.transpose(0,1).contiguous().view(inputLen, dimEmb)
+        out = out.transpose(0, 1).contiguous().view(inputLen, dimEmb)
         # use final projection to understand how to combine the information from all heads
         return out @ self.wOut
-
 
 
 class Transformer:
@@ -192,22 +222,26 @@ class SmallGPT:
         torch.manual_seed(0xCAFEBABE)
         dimEmb = config["dimEmb"]
         maxWindowSize = config["maxWindowSize"]
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-        self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+        self.tokenizer = HuggingFaceTokenizer()
         self.maxWindowSize = maxWindowSize
-        self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.n_vocab, dimEmb)
+        self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.vocabSize(), dimEmb)
         self.posEmbedding = torch.nn.Embedding(maxWindowSize, dimEmb)
         self.transformers = [Transformer(config) for _ in range(config["numLayer"])]
         self.finalNorm = Normalization(config)
-        self.out = torch.nn.Linear(dimEmb, self.tokenizer.n_vocab, bias=False)
+        self.out = torch.nn.Linear(dimEmb, self.tokenizer.vocabSize(), bias=False)
         self.to(self.device)
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=config["learningRate"])
 
-    def encode(self, input):
-        return self.tokenizer.encode(input)
+    def encode(self, x):
+        return self.tokenizer.encode(x)
 
-    def decode(self, input):
-        return self.tokenizer.decode(input)
+    def decode(self, x):
+        return self.tokenizer.decode(x)
 
     def parameters(self):
         params = list(self.tokenEmbedding.parameters()) + list(
@@ -253,6 +287,8 @@ class SmallGPT:
         print(f"@@    Device: {self.device}")
         print(f"@@    Total Parameters: {totalParams}")
         print(f"@@    Memory Usage: {totalParams * 4 / 1024 / 1024:.2f} MB")
+        print(f"@@    Max Window Size: {self.maxWindowSize}")
+        print(f"@@    Tokenizer: {self.tokenizer.__class__.__name__}")
 
     def nextToken(self, input, temperature=0.9):
         with torch.no_grad():
@@ -266,10 +302,11 @@ class SmallGPT:
         dataset = []
         for path in config["dataset"]:
             with open(path, "r", encoding="utf-8") as f:
-                tokens = torch.tensor(self.encode(f.read()))   
+                tokens = torch.tensor(self.encode(f.read()))
                 for i in range(0, len(tokens) - 1, self.maxWindowSize):
                     chunk = tokens[i : i + self.maxWindowSize + 1]
                     dataset.append((chunk[:-1], chunk[1:]))
+        random.shuffle(dataset)
         return dataset
 
     def train(self, numEpoch):
@@ -299,7 +336,9 @@ class SmallGPT:
         with torch.no_grad():
             for _ in range(maxTokens):
                 window = tokenIds[-self.maxWindowSize :]
-                t = self.nextToken(torch.tensor(window, dtype=torch.long, device=self.device))
+                t = self.nextToken(
+                    torch.tensor(window, dtype=torch.long, device=self.device)
+                )
                 tokenIds.append(t)
         print(f"@@ Output: {self.decode(tokenIds)}")
 
@@ -315,3 +354,10 @@ else:
     smallGPT.predict("神雕大侠")
     smallGPT.predict("韦小宝和双儿")
     smallGPT.predict("围攻光明顶")
+    smallGPT.predict("郭靖和黄蓉")
+    smallGPT.predict("张无忌")
+    smallGPT.predict("令狐冲说")
+    smallGPT.predict("华山论剑")
+    smallGPT.predict("桃花岛上")
+    smallGPT.predict("少林寺")
+    smallGPT.predict("降龙十八掌")
