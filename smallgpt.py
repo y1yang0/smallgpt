@@ -1,3 +1,17 @@
+# Copyright (c) 2026 yyang. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
 from tokenizers import Tokenizer
 import tiktoken
 import torch
@@ -29,6 +43,7 @@ config = {
     "dropoutRate": 0.0,
     "learningRate": 3e-4,
     "numEpoch": 10,
+    "batchSize": 16,
 }
 
 
@@ -60,7 +75,6 @@ class HuggingFaceTokenizer:
 
     def vocabSize(self):
         return self.tokenizer.get_vocab_size()
-
 
 class Normalization:
     def __init__(self, config):
@@ -131,49 +145,25 @@ class Attention:
         query = x @ self.wQuery
         key = x @ self.wKey
         value = x @ self.wValue
-        # split Q,K,V into multiple heads, the underlying tensor is still the same
-        inputLen, dimEmb = x.shape
+        # split the Q,K,V tensor into multiple heads, each head has dimHead
+        # dimensions. Intuitively, I view old [batchSize, inputLen, dimEmb] as
+        # [batchSize, numHead, inputLen, dimHead], but it turns out that it
+        # should be firstly viewed as [batchSize, inputLen, numHead, dimHead] 
+        # and transpose(1,2) dimensions to get the desired shape
+        batchSize, inputLen, dimEmb = x.shape
         dimHead = dimEmb // self.numHead
-        # we want to split the tensor into numHead heads, each head has dimHead
-        # dimensions. If the tensor query(2x6) is as follows(numHead = 3, dimHead = 2)
-        # tensor([[ 0,  1,  2,  3,  4,  5],
-        #         [ 6,  7,  8,  9, 10, 11]])
-        # intuitively, the view shape is [numHead, inputLen, dimHead]
-        # >>> query.view(3,2,2)
-        # tensor([[[ 0,  1],
-        #          [ 2,  3]],
-        #         [[ 4,  5],
-        #          [ 6,  7]],
-        #         [[ 8,  9],
-        #          [10, 11]]])
-        # but actually, we want the following shape:
-        # tensor([[[ 0,  1],
-        #          [ 6,  7]],
-        #         [[ 2,  3],
-        #          [ 8,  9]],
-        #         [[ 4,  5],
-        #          [10, 11]]])
-        # so we view as [inputLen, numHead, dimHead]
-        # >>> query.view(2,3,2)
-        # tensor([[[ 0,  1],
-        #          [ 2,  3],
-        #          [ 4,  5]],
-        #         [[ 6,  7],
-        #          [ 8,  9],
-        #          [10, 11]]])
-        # and then transpose the first two dimensions to get the desired shape
-        queries = query.view(inputLen, self.numHead, dimHead).transpose(0, 1)
-        keys = key.view(inputLen, self.numHead, dimHead).transpose(0, 1)
-        values = value.view(inputLen, self.numHead, dimHead).transpose(0, 1)
-        # Attention(Q,K,V) = softmax(mask(Q@K^T / sqrt(d_k))) @ V
+        queries = query.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
+        keys = key.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
+        values = value.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
+        # compute Attention(Q,K,V) = softmax(mask(Q@K^T / sqrt(d_k))) @ V
         #
         # attention socre means which tokens are most relevant to current token
-        # Q(numHead, inputLen, dimHead) @ K^T(numHead, dimHead, inputLen)
-        # = attnScore(numHead, inputLen, inputLen)
+        #   Q(batchSize, numHead, inputLen, dimHead) @ K^T(batchSize, numHead, dimHead, inputLen)
+        #   = attnScore(batchSize, numHead, inputLen, inputLen)
         attnScore = queries @ keys.transpose(-2, -1) / (dimHead**0.5)
         # use causal mask to prevent the current token from seeing future tokens
-        # attnScore(numHead, inputLen, inputLen) @ mask(numHead, inputLen, inputLen)
-        # = maskedAttnScore(numHead, inputLen, inputLen)
+        #   attnScore(batchSize, numHead, inputLen, inputLen) @ mask(batchSize, numHead, inputLen, inputLen)
+        #   = maskedAttnScore(batchSize, numHead, inputLen, inputLen)
         mask = torch.tril(torch.ones(inputLen, inputLen, device=x.device))
         attnScore = attnScore.masked_fill(mask == 0, -torch.inf)
         # apply softmax to get the attention weights
@@ -181,12 +171,14 @@ class Attention:
         # apply dropout to prevent overfitting
         attnWeights = self.dropout(attnWeights)
         # apply weights to the values to get the output
-        # (numHead, inputLen, inputLen) @ (numHead, inputLen, dimHead)
-        # = out(numHead, inputLen, dimHead)
+        #   attnWeights(batchSize, numHead, inputLen, inputLen) @ V(batchSize, numHead, inputLen, dimHead)
+        #   = out(batchSize, numHead, inputLen, dimHead)
         out = attnWeights @ values
-        # merge all heads
-        out = out.transpose(0, 1).contiguous().view(inputLen, dimEmb)
-        # use final projection to understand how to combine the information from all heads
+        # merge all attention heads back and apply final projection to understand how to 
+        # combine the information from all heads
+        #   out(batchSize, numHead, inputLen, dimHead)
+        #   = out(batchSize, inputLen, dimEmb)
+        out = out.transpose(1, 2).contiguous().view(batchSize, inputLen, dimEmb)
         return out @ self.wOut
 
 
@@ -229,6 +221,7 @@ class SmallGPT:
         )
         self.tokenizer = HuggingFaceTokenizer()
         self.maxWindowSize = maxWindowSize
+        self.batchSize = config["batchSize"]
         self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.vocabSize(), dimEmb)
         self.posEmbedding = torch.nn.Embedding(maxWindowSize, dimEmb)
         self.transformers = [Transformer(config) for _ in range(config["numLayer"])]
@@ -264,7 +257,7 @@ class SmallGPT:
 
     def compute(self, input):
         # attach the token embeddings with the position sequence [0,1,2,...]
-        pos = torch.arange(len(input), device=self.device)
+        pos = torch.arange(input.shape[1], device=self.device)
         x = self.tokenEmbedding(input) + self.posEmbedding(pos)
         for transformer in self.transformers:
             x = transformer.compute(x)
@@ -292,38 +285,63 @@ class SmallGPT:
 
     def nextToken(self, input, temperature=0.9):
         with torch.no_grad():
-            logits = self.compute(input)
-            logits = logits[-1, :] / temperature
+            logits = self.compute(torch.stack([input]))
+            logits = logits[0, -1, :] / temperature
             probs = torch.softmax(logits, dim=-1)
             nextTokenId = torch.multinomial(probs, num_samples=1)
             return nextTokenId.item()
 
-    def loadDataset(self):
+    def loadDataBatch(self):
+        # all books concatenated into a single string and split then into chunks of maxWindowSize
+        # each chunk is a (input, target) pair
         dataset = []
         for path in config["dataset"]:
             with open(path, "r", encoding="utf-8") as f:
                 tokens = torch.tensor(self.encode(f.read()))
                 for i in range(0, len(tokens) - 1, self.maxWindowSize):
                     chunk = tokens[i : i + self.maxWindowSize + 1]
+                    if len(chunk) != self.maxWindowSize + 1:
+                        continue # drop the last unaligned chunk
                     dataset.append((chunk[:-1], chunk[1:]))
+        # shuffle the dataset to prevent the model from being overfitted
         random.shuffle(dataset)
-        return dataset
+        # pack the dataset into smaller batches, i.e.
+        # [(input, target), (input1, target1), ...] => 
+        # batch1: [input, input1, ...], [target, target1, ...]
+        # batch2: [inputN, inputN+1, ...], [targetN, targetN+1, ...]
+        batches = []
+        for idx in range(0, len(dataset), self.batchSize):
+            # [(input, target), (input1, target1), ...]
+            batch = dataset[idx : idx + self.batchSize]
+            # [input, input1, ...], [target, target1, ...]
+            inputBatch, targetBatch = zip(*batch)
+            # tensor([input, input1, ...]), tensor([target, target1, ...])
+            inputBatch = torch.stack(inputBatch)
+            targetBatch = torch.stack(targetBatch)
+            batches.append((inputBatch, targetBatch))
+        return batches
 
     def train(self, numEpoch):
-        # read training data from files
-        dataset = self.loadDataset()
-        print(f"@@ Loaded dataset size: {len(dataset)}")
-        # train the model
         for epoch in range(numEpoch):
-            for idx, (input, target) in enumerate(dataset):
+            batches = self.loadDataBatch()
+            for (idx, (input, target)) in enumerate(batches):
                 input, target = input.to(self.device), target.to(self.device)
                 output = self.compute(input)
+                # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
+                # it means every sample has a prob distribution over all classes as output
+                # and a single class as target
+                # while I have out(batchSize, inputLen(numSample), vocabSize(numClass))
+                # and target(batchSize, inputLen(numSample)), so I need to flatten them
+                # as out(batchSize * inputLen, vocabSize) and target(batchSize * inputLen)
+                output = output.view(output.shape[0] * output.shape[1], output.shape[2])
+                target = target.view(target.shape[0] * target.shape[1])
                 loss = torch.nn.functional.cross_entropy(output, target)
                 print(
-                    f"\r@@ Epoch: {epoch} Progress: {idx/len(dataset)*100:.2f}% Loss: {loss.item():.4f}",
+                    f"\r@@ Epoch: {epoch} Progress: {idx/len(batches)*100:.2f}% Loss: {loss.item():.4f}",
                     end="",
                 )
                 loss.backward()
+                # prevent the exploding gradient problem
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
