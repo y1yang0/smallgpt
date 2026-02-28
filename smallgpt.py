@@ -13,6 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 from tokenizers import Tokenizer
+from torch.nn import functional as functional
 import tiktoken
 import torch
 import sys
@@ -93,25 +94,25 @@ class Normalization:
 class FeedForward:
     def __init__(self, config):
         dimEmb = config["dimEmb"]
-        # up-project the input to a higher dimension so that the model can find
-        # similar patterns in the data, non-linear activation function could
-        # "turn on" or "turn off" certain patterns
-        self.layer1 = torch.nn.Linear(dimEmb, dimEmb * 4)
-        self.layer2 = torch.nn.GELU()
-        # down-project the input back to original dimension so that the model
-        # can extract the detailed knowledge from the matched patterns
-        self.layer3 = torch.nn.Linear(dimEmb * 4, dimEmb)
+        dimHidden = int(2/3 * 4 * dimEmb)
+        self.wGate = torch.nn.Linear(dimEmb, dimHidden, bias=False)
+        self.wValue = torch.nn.Linear(dimEmb, dimHidden, bias=False)
+        self.wOut = torch.nn.Linear(dimHidden, dimEmb, bias=False)
 
     def compute(self, x):
-        # FFN(x) = GELU(x @ W1 + b1) @ W2 + b2
-        return self.layer3(self.layer2(self.layer1(x)))
+        # SwiGLU(x) = (SiLU(x @ wGate) * x @ wValue) @ wOut
+        # SiLU(x @ wGate) computes the 0~1 gate value to control how much
+        # features from (x @ wValue) should be extracted and wOut projects
+        # weighted features to real knowledge
+        return self.wOut(functional.silu(self.wGate(x)) * self.wValue(x))
 
     def to(self, device):
-        self.layer1.to(device)
-        self.layer3.to(device)
+        self.wGate.to(device)
+        self.wValue.to(device)
+        self.wOut.to(device)
 
     def parameters(self):
-        return list(self.layer1.parameters()) + list(self.layer3.parameters())
+        return list(self.wGate.parameters()) + list(self.wValue.parameters()) + list(self.wOut.parameters())
 
 
 class Attention:
@@ -335,7 +336,7 @@ class SmallGPT:
                 # as out(batchSize * inputLen, vocabSize) and target(batchSize * inputLen)
                 output = output.view(output.shape[0] * output.shape[1], output.shape[2])
                 target = target.view(target.shape[0] * target.shape[1])
-                loss = torch.nn.functional.cross_entropy(output, target)
+                loss = functional.cross_entropy(output, target)
                 print(
                     f"\r@@ Epoch: {epoch} Progress: {idx/len(batches)*100:.2f}% Loss: {loss.item():.4f}",
                     end="",
