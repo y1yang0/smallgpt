@@ -223,6 +223,7 @@ class SmallGPT:
         self.tokenizer = HuggingFaceTokenizer()
         self.maxWindowSize = maxWindowSize
         self.batchSize = config["batchSize"]
+        self.learningRate = config["learningRate"]
         self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.vocabSize(), dimEmb)
         self.posEmbedding = torch.nn.Embedding(maxWindowSize, dimEmb)
         self.transformers = [Transformer(config) for _ in range(config["numLayer"])]
@@ -231,7 +232,7 @@ class SmallGPT:
         # tie the output projection with the token embedding to save memory
         self.out.weight = self.tokenEmbedding.weight
         self.to(self.device)
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=config["learningRate"])
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.learningRate)
 
     def encode(self, x):
         return self.tokenizer.encode(x)
@@ -324,8 +325,12 @@ class SmallGPT:
         return batches
 
     def train(self, numEpoch):
+        batches = self.loadDataBatch()
+        maxIter = numEpoch * len(batches)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=maxIter, eta_min=self.learningRate * 0.1
+        )
         for epoch in range(numEpoch):
-            batches = self.loadDataBatch()
             for (idx, (input, target)) in enumerate(batches):
                 input, target = input.to(self.device), target.to(self.device)
                 output = self.compute(input)
@@ -346,6 +351,7 @@ class SmallGPT:
                 # prevent the exploding gradient problem
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
                 self.optimizer.step()
+                scheduler.step()
                 self.optimizer.zero_grad()
             # save the model weights
             self.save("smallgpt.bin")
