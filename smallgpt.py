@@ -1,17 +1,4 @@
 # Copyright (c) 2026 yyang. All rights reserved.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <http://www.gnu.org/licenses/>.
 from tokenizers import Tokenizer
 from torch.nn import functional as functional
 import tiktoken
@@ -41,12 +28,13 @@ config = {
     "numLayer": 8,
     "numHead": 8,
     "maxWindowSize": 512,
-    "dropoutRate": 0.0,
+    "dropoutRate": 0.1,
     "learningRate": 3e-4,
-    "numEpoch": 20,
-    "batchSize": 64,
+    "numEpoch": 10,
+    "batchSize": 16,
 }
 
+isTraining = True
 
 # My first learned tokenizer
 class TiktokenTokenizer:
@@ -100,18 +88,23 @@ class FeedForward:
         self.wGate = torch.nn.Linear(dimEmb, dimHidden, bias=False)
         self.wValue = torch.nn.Linear(dimEmb, dimHidden, bias=False)
         self.wOut = torch.nn.Linear(dimHidden, dimEmb, bias=False)
+        self.dropout = torch.nn.Dropout(config["dropoutRate"])
 
     def compute(self, x):
         # SwiGLU(x) = (SiLU(x @ wGate) * x @ wValue) @ wOut
         # SiLU(x @ wGate) computes the 0~1 gate value to control how much
         # features from (x @ wValue) should be extracted and wOut projects
         # weighted features to real knowledge
-        return self.wOut(functional.silu(self.wGate(x)) * self.wValue(x))
+        x = functional.silu(self.wGate(x)) * self.wValue(x)
+        if isTraining:
+            x = self.dropout(x)
+        return self.wOut(x)
 
     def to(self, device):
         self.wGate.to(device)
         self.wValue.to(device)
         self.wOut.to(device)
+        self.dropout.to(device)
 
     def parameters(self):
         return (
@@ -145,6 +138,7 @@ class Attention:
         self.wKey.to(device)
         self.wValue.to(device)
         self.wOut.to(device)
+        self.dropout.to(device)
 
     def compute(self, x):
         # compute Q,K,V at once
@@ -175,7 +169,8 @@ class Attention:
         # apply softmax to get the attention weights
         attnWeights = torch.softmax(attnScore, dim=-1)
         # apply dropout to prevent overfitting
-        attnWeights = self.dropout(attnWeights)
+        if isTraining:
+            attnWeights = self.dropout(attnWeights)
         # apply weights to the values to get the output
         #   attnWeights(batchSize, numHead, inputLen, inputLen) @ V(batchSize, numHead, inputLen, dimHead)
         #   = out(batchSize, numHead, inputLen, dimHead)
@@ -332,6 +327,8 @@ class SmallGPT:
         return batches
 
     def train(self, numEpoch):
+        global isTraining
+        isTraining = True
         for epoch in range(numEpoch):
             batches = self.loadDataBatch()
             for (idx, (input, target)) in enumerate(batches):
@@ -360,6 +357,8 @@ class SmallGPT:
             smallGPT.predict("杨过和小龙女在")
 
     def predict(self, text, maxTokens=30):
+        global isTraining
+        isTraining = False
         print(f"@@ Input: {text}")
         tokenIds = self.encode(text)
         with torch.no_grad():
