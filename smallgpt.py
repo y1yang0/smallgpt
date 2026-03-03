@@ -234,8 +234,6 @@ class SmallGPT:
         self.transformers = [Transformer(config) for _ in range(config["numLayer"])]
         self.finalNorm = Normalization(config)
         self.out = torch.nn.Linear(dimEmb, self.tokenizer.vocabSize(), bias=False)
-        # tie the output projection with the token embedding to save memory
-        self.out.weight = self.tokenEmbedding.weight
         self.to(self.device)
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.learningRate)
 
@@ -252,6 +250,7 @@ class SmallGPT:
         for t in self.transformers:
             params += t.parameters()
         params += self.finalNorm.parameters()
+        params += list(self.out.parameters())
         return params
 
     def to(self, device):
