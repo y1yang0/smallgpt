@@ -66,6 +66,51 @@ class HuggingFaceTokenizer:
     def vocabSize(self):
         return self.tokenizer.get_vocab_size()
 
+class DataLoader:
+    def __init__(self, config, tokenizer):
+        self.maxWindowSize = config["maxWindowSize"]
+        self.batchSize = config["batchSize"]
+        self.tokenizer = tokenizer
+        self.numTokens = 0
+        self.batches = self.loadDataBatch()
+
+    def loadDataBatch(self):
+        # all books concatenated into a single string and split then into chunks
+        # of maxWindowSize, each chunk is a (input, target) pair
+        dataset = []
+        for path in config["dataset"]:
+            with open(path, "r", encoding="utf-8") as f:
+                tokens = torch.tensor(self.tokenizer.encode(f.read()))
+                self.numTokens += len(tokens)
+                for i in range(0, len(tokens) - 1, self.maxWindowSize):
+                    chunk = tokens[i : i + self.maxWindowSize + 1]
+                    if len(chunk) != self.maxWindowSize + 1:
+                        continue  # drop the last unaligned chunk
+                    dataset.append((chunk[:-1], chunk[1:]))
+
+        # pack the dataset into smaller batches, i.e.
+        # [(input, target), (input1, target1), ...] =>
+        # batch1: [input, input1, ...], [target, target1, ...]
+        # batch2: [inputN, inputN+1, ...], [targetN, targetN+1, ...]
+        batches = []
+        for idx in range(0, len(dataset), self.batchSize):
+            # [(input, target), (input1, target1), ...]
+            batch = dataset[idx : idx + self.batchSize]
+            # [input, input1, ...], [target, target1, ...]
+            inputBatch, targetBatch = zip(*batch)
+            # tensor([input, input1, ...]), tensor([target, target1, ...])
+            inputBatch = torch.stack(inputBatch)
+            targetBatch = torch.stack(targetBatch)
+            batches.append((inputBatch, targetBatch))
+        return batches
+
+    def numBatches(self):
+        return len(self.batches)
+
+    def __iter__(self):
+        # shuffle the dataset every epoch to prevent model from being overfitted
+        random.shuffle(dataset)
+        return iter(self.batches)
 
 class Normalization:
     def __init__(self, config):
@@ -214,28 +259,20 @@ class SmallGPT:
     def __init__(self, config):
         torch.manual_seed(0xCAFEBABE)
         dimEmb = config["dimEmb"]
-        maxWindowSize = config["maxWindowSize"]
         self.device = torch.device(
             "cuda"
             if torch.cuda.is_available()
             else "mps" if torch.backends.mps.is_available() else "cpu"
         )
         self.tokenizer = HuggingFaceTokenizer()
-        self.maxWindowSize = maxWindowSize
-        self.batchSize = config["batchSize"]
         self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.vocabSize(), dimEmb)
-        self.posEmbedding = torch.nn.Embedding(maxWindowSize, dimEmb)
+        self.posEmbedding = torch.nn.Embedding(config["maxWindowSize"], dimEmb)
         self.transformers = [Transformer(config) for _ in range(config["numLayer"])]
         self.finalNorm = Normalization(config)
         self.out = torch.nn.Linear(dimEmb, self.tokenizer.vocabSize(), bias=False)
         self.to(self.device)
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=config["learningRate"])
-
-    def encode(self, x):
-        return self.tokenizer.encode(x)
-
-    def decode(self, x):
-        return self.tokenizer.decode(x)
+        self.dataloader = DataLoader(config, tokenizer=self.tokenizer)
 
     def parameters(self):
         params = list(self.tokenEmbedding.parameters()) + list(
@@ -265,11 +302,11 @@ class SmallGPT:
         x = self.finalNorm.compute(x)
         return self.out(x)
 
-    def save(self, path):
+    def saveWeights(self, path):
         torch.save([p.data.cpu() for p in self.parameters()], path)
         print(f"@@ Model saved to {path}")
 
-    def load(self, path):
+    def loadWeights(self, path):
         state = torch.load(path, weights_only=True, map_location=self.device)
         for p, data in zip(self.parameters(), state):
             p.data.copy_(data)
@@ -279,10 +316,13 @@ class SmallGPT:
         totalParams = sum(p.numel() for p in self.parameters())
         print(f"@@ SmallGPT Configuration:")
         print(f"@@    Device: {self.device}")
-        print(f"@@    Total Parameters: {totalParams}")
-        print(f"@@    Memory Usage: {totalParams * 4 / 1024 / 1024:.2f} MB")
-        print(f"@@    Max Window Size: {self.maxWindowSize}")
+        print(f"@@    Model Parameters: {totalParams}")
+        print(f"@@    Model Memory Usage: {totalParams * 4 / 1024 / 1024:.2f} MB")
         print(f"@@    Tokenizer: {self.tokenizer.__class__.__name__}")
+        print(f"@@    Tokenizer VocabSize: {self.tokenizer.vocabSize()}")
+        print(f"@@    Dataset Batches: {self.dataloader.numBatches()}")
+        print(f"@@    Dataset Tokens: {self.dataloader.numTokens}")
+        print(f"@@    Dataset WindowSize: {self.dataloader.maxWindowSize}")
 
     def nextToken(self, input, temperature=0.9):
         with torch.no_grad():
@@ -292,46 +332,11 @@ class SmallGPT:
             nextTokenId = torch.multinomial(probs, num_samples=1)
             return nextTokenId.item()
 
-    def loadDataBatch(self):
-        # all books concatenated into a single string and split then into chunks
-        # of maxWindowSize, each chunk is a (input, target) pair
-        dataset = []
-        totalTokens = 0
-        for path in config["dataset"]:
-            with open(path, "r", encoding="utf-8") as f:
-                tokens = torch.tensor(self.encode(f.read()))
-                totalTokens += len(tokens)
-                for i in range(0, len(tokens) - 1, self.maxWindowSize):
-                    chunk = tokens[i : i + self.maxWindowSize + 1]
-                    if len(chunk) != self.maxWindowSize + 1:
-                        continue  # drop the last unaligned chunk
-                    dataset.append((chunk[:-1], chunk[1:]))
-        # shuffle the dataset to prevent the model from being overfitted
-        random.shuffle(dataset)
-        print(f"@@ Total Dataset Tokens: {totalTokens}")
-        print(f"@@ Token Per Batch: {totalTokens / len(dataset)}")
-        # pack the dataset into smaller batches, i.e.
-        # [(input, target), (input1, target1), ...] =>
-        # batch1: [input, input1, ...], [target, target1, ...]
-        # batch2: [inputN, inputN+1, ...], [targetN, targetN+1, ...]
-        batches = []
-        for idx in range(0, len(dataset), self.batchSize):
-            # [(input, target), (input1, target1), ...]
-            batch = dataset[idx : idx + self.batchSize]
-            # [input, input1, ...], [target, target1, ...]
-            inputBatch, targetBatch = zip(*batch)
-            # tensor([input, input1, ...]), tensor([target, target1, ...])
-            inputBatch = torch.stack(inputBatch)
-            targetBatch = torch.stack(targetBatch)
-            batches.append((inputBatch, targetBatch))
-        return batches
-
     def train(self, numEpoch):
         global isTraining
         isTraining = True
         for epoch in range(numEpoch):
-            batches = self.loadDataBatch()
-            for (idx, (input, target)) in enumerate(batches):
+            for (idx, (input, target)) in enumerate(self.dataloader):
                 input, target = input.to(self.device), target.to(self.device)
                 output = self.compute(input)
                 # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
@@ -344,7 +349,7 @@ class SmallGPT:
                 target = target.view(target.shape[0] * target.shape[1])
                 loss = functional.cross_entropy(output, target)
                 print(
-                    f"\r@@ Epoch: {epoch} Progress: {idx/len(batches)*100:.2f}% Loss: {loss.item():.4f}",
+                    f"\r@@ Epoch: {epoch} Progress: {idx/self.dataloader.numBatches()*100:.2f}% Loss: {loss.item():.4f}",
                     end="",
                 )
                 loss.backward()
@@ -353,22 +358,22 @@ class SmallGPT:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
             # save the model weights
-            self.save("smallgpt.bin")
+            self.saveWeights("smallgpt.bin")
             smallGPT.predict("杨过和小龙女在")
 
     def predict(self, text, maxTokens=30):
         global isTraining
         isTraining = False
         print(f"@@ Input: {text}")
-        tokenIds = self.encode(text)
+        tokenIds = self.tokenizer.encode(text)
         with torch.no_grad():
             for _ in range(maxTokens):
-                window = tokenIds[-self.maxWindowSize :]
+                window = tokenIds[-self.maxWindowSize() :]
                 t = self.nextToken(
                     torch.tensor(window, dtype=torch.long, device=self.device)
                 )
                 tokenIds.append(t)
-        print(f"@@ Output: {self.decode(tokenIds)}")
+        print(f"@@ Output: {self.tokenizer.decode(tokenIds)}")
 
 
 smallGPT = SmallGPT(config)
@@ -377,7 +382,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "train":
     smallGPT.printConfig()
     smallGPT.train(config["numEpoch"])
 else:
-    smallGPT.load("smallgpt.bin")
+    smallGPT.loadWeights("smallgpt.bin")
     smallGPT.predict("杨过和小龙女在")
     smallGPT.predict("神雕大侠")
     smallGPT.predict("韦小宝和双儿")
