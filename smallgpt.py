@@ -43,8 +43,8 @@ config = {
     "maxWindowSize": 512,
     "dropoutRate": 0.0,
     "learningRate": 3e-4,
-    "numEpoch": 10,
-    "batchSize": 16,
+    "numEpoch": 20,
+    "batchSize": 64,
 }
 
 
@@ -62,6 +62,7 @@ class TiktokenTokenizer:
     def vocabSize(self):
         return self.tokenizer.n_vocab
 
+
 # Self-trained tokenizer for Jinyong-specific dataset, from huggingface/tokenizer
 class HuggingFaceTokenizer:
     def __init__(self):
@@ -76,6 +77,7 @@ class HuggingFaceTokenizer:
 
     def vocabSize(self):
         return self.tokenizer.get_vocab_size()
+
 
 class Normalization:
     def __init__(self, config):
@@ -94,7 +96,7 @@ class Normalization:
 class FeedForward:
     def __init__(self, config):
         dimEmb = config["dimEmb"]
-        dimHidden = int(2/3 * 4 * dimEmb)
+        dimHidden = int(2 / 3 * 4 * dimEmb)
         self.wGate = torch.nn.Linear(dimEmb, dimHidden, bias=False)
         self.wValue = torch.nn.Linear(dimEmb, dimHidden, bias=False)
         self.wOut = torch.nn.Linear(dimHidden, dimEmb, bias=False)
@@ -112,44 +114,47 @@ class FeedForward:
         self.wOut.to(device)
 
     def parameters(self):
-        return list(self.wGate.parameters()) + list(self.wValue.parameters()) + list(self.wOut.parameters())
+        return (
+            list(self.wGate.parameters())
+            + list(self.wValue.parameters())
+            + list(self.wOut.parameters())
+        )
 
 
 class Attention:
     def __init__(self, config):
         dimEmb = config["dimEmb"]
         self.numHead = config["numHead"]
-        scale = dimEmb**-0.5
-        self.wQuery = torch.nn.Parameter(
-            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
-        )
-        self.wKey = torch.nn.Parameter(
-            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
-        )
-        self.wValue = torch.nn.Parameter(
-            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
-        )
-        self.wOut = torch.nn.Parameter(
-            torch.randn(dimEmb, dimEmb) * scale, requires_grad=True
-        )
+        # Use Kaiming initialization for better convergence
+        self.wQuery = torch.nn.Linear(dimEmb, dimEmb, bias=False)
+        self.wKey = torch.nn.Linear(dimEmb, dimEmb, bias=False)
+        self.wValue = torch.nn.Linear(dimEmb, dimEmb, bias=False)
+        self.wOut = torch.nn.Linear(dimEmb, dimEmb, bias=False)
         self.dropout = torch.nn.Dropout(config["dropoutRate"])
 
     def parameters(self):
-        return [self.wQuery, self.wKey, self.wValue, self.wOut]
+        return (
+            list(self.wQuery.parameters())
+            + list(self.wKey.parameters())
+            + list(self.wValue.parameters())
+            + list(self.wOut.parameters())
+        )
 
     def to(self, device):
-        for p in self.parameters():
-            p.data = p.data.to(device)
+        self.wQuery.to(device)
+        self.wKey.to(device)
+        self.wValue.to(device)
+        self.wOut.to(device)
 
     def compute(self, x):
         # compute Q,K,V at once
-        query = x @ self.wQuery
-        key = x @ self.wKey
-        value = x @ self.wValue
+        query = self.wQuery(x)
+        key = self.wKey(x)
+        value = self.wValue(x)
         # split the Q,K,V tensor into multiple heads, each head has dimHead
         # dimensions. Intuitively, I view old [batchSize, inputLen, dimEmb] as
         # [batchSize, numHead, inputLen, dimHead], but it turns out that it
-        # should be firstly viewed as [batchSize, inputLen, numHead, dimHead] 
+        # should be firstly viewed as [batchSize, inputLen, numHead, dimHead]
         # and transpose(1,2) dimensions to get the desired shape
         batchSize, inputLen, dimEmb = x.shape
         dimHead = dimEmb // self.numHead
@@ -175,12 +180,12 @@ class Attention:
         #   attnWeights(batchSize, numHead, inputLen, inputLen) @ V(batchSize, numHead, inputLen, dimHead)
         #   = out(batchSize, numHead, inputLen, dimHead)
         out = attnWeights @ values
-        # merge all attention heads back and apply final projection to understand how to 
-        # combine the information from all heads
+        # merge all attention heads back and apply final projection to understand
+        # how to combine the information from all heads
         #   out(batchSize, numHead, inputLen, dimHead)
         #   = out(batchSize, inputLen, dimEmb)
         out = out.transpose(1, 2).contiguous().view(batchSize, inputLen, dimEmb)
-        return out @ self.wOut
+        return self.wOut(out)
 
 
 class Transformer:
@@ -295,21 +300,25 @@ class SmallGPT:
             return nextTokenId.item()
 
     def loadDataBatch(self):
-        # all books concatenated into a single string and split then into chunks of maxWindowSize
-        # each chunk is a (input, target) pair
+        # all books concatenated into a single string and split then into chunks
+        # of maxWindowSize, each chunk is a (input, target) pair
         dataset = []
+        totalTokens = 0
         for path in config["dataset"]:
             with open(path, "r", encoding="utf-8") as f:
                 tokens = torch.tensor(self.encode(f.read()))
+                totalTokens += len(tokens)
                 for i in range(0, len(tokens) - 1, self.maxWindowSize):
                     chunk = tokens[i : i + self.maxWindowSize + 1]
                     if len(chunk) != self.maxWindowSize + 1:
-                        continue # drop the last unaligned chunk
+                        continue  # drop the last unaligned chunk
                     dataset.append((chunk[:-1], chunk[1:]))
         # shuffle the dataset to prevent the model from being overfitted
         random.shuffle(dataset)
+        print(f"@@ Total Dataset Tokens: {totalTokens}")
+        print(f"@@ Token Per Batch: {totalTokens / len(dataset)}")
         # pack the dataset into smaller batches, i.e.
-        # [(input, target), (input1, target1), ...] => 
+        # [(input, target), (input1, target1), ...] =>
         # batch1: [input, input1, ...], [target, target1, ...]
         # batch2: [inputN, inputN+1, ...], [targetN, targetN+1, ...]
         batches = []
@@ -331,7 +340,7 @@ class SmallGPT:
             self.optimizer, T_max=maxIter, eta_min=self.learningRate * 0.1
         )
         for epoch in range(numEpoch):
-            for (idx, (input, target)) in enumerate(batches):
+            for idx, (input, target) in enumerate(batches):
                 input, target = input.to(self.device), target.to(self.device)
                 output = self.compute(input)
                 # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
@@ -355,6 +364,7 @@ class SmallGPT:
                 self.optimizer.zero_grad()
             # save the model weights
             self.save("smallgpt.bin")
+            smallGPT.predict("杨过和小龙女在")
 
     def predict(self, text, maxTokens=30):
         print(f"@@ Input: {text}")
