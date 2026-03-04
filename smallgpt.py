@@ -7,14 +7,14 @@ import glob, os, time, random, sys
 
 config = {
     "dataset": "data/small", # Jinyong's 15 novels
-    "dimEmb": 512,
+    "dimEmb": 384,
     "numLayer": 8,
-    "numHead": 8,
+    "numHead": 6,
     "maxWindowSize": 512,
-    "dropoutRate": 0.1,
+    "dropoutRate": 0.3,
     "learningRate": 3e-4,
     "numEpoch": 10,
-    "batchSize": 16,
+    "batchSize": 32,
     "trainDataRatio": 0.9
 }
 
@@ -154,7 +154,7 @@ class FeedForward:
 
 
 class Attention:
-    def __init__(self, config):
+    def __init__(self, config, cos, sin):
         dimEmb = config["dimEmb"]
         self.numHead = config["numHead"]
         # Use Kaiming initialization for better convergence
@@ -163,6 +163,7 @@ class Attention:
         self.wValue = torch.nn.Linear(dimEmb, dimEmb, bias=False)
         self.wOut = torch.nn.Linear(dimEmb, dimEmb, bias=False)
         self.dropout = torch.nn.Dropout(config["dropoutRate"])
+        self.cos, self.sin = cos, sin
 
     def parameters(self):
         return (
@@ -178,9 +179,37 @@ class Attention:
         self.wValue.to(device)
         self.wOut.to(device)
         self.dropout.to(device)
+        self.cos.to(device)
+        self.sin.to(device)
+    
+    def applyRoPE(self, q, k, inputLen):
+        # q and k are (batchSize, numHead, inputLen, dimHead)
+        # cos and sin are (inputLen, dimHead//2)
+        cos, sin = self.cos[:inputLen,:], self.sin[:inputLen,:]
+        # cos and sin are (1, 1, inputLen, dimHead//2)
+        # now they are matched with Q and K
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        # qeven, qodd are (batchSize, numHead, inputLen, dimHead//2)
+        # where last dimension is [q0,q2,q4...] [q1,q3,q5...]
+        qeven, qodd = q[..., ::2], q[..., 1::2]
+        keven, kodd = k[..., ::2], k[..., 1::2]
+        # q0*cos(θ) - q1*sin(θ)
+        # q1*cos(θ) + q0*sin(θ)
+        # ... and so on
+        rotatedQeven = qeven* cos - qodd * sin
+        rotatedQodd = qodd* cos + qeven * sin
+        rotatedKeven = keven* cos - kodd * sin
+        rotatedKodd = kodd* cos + keven * sin
+        # rotatedQ and rotatedK are (batchSize, numHead, inputLen, dimHead//2, 2)
+        # so I should flatten the last dimension to get back to
+        # (batchSize, numHead, inputLen, dimHead)
+        rotatedQ = torch.stack([rotatedQeven, rotatedQodd], dim=-1).flatten(-2)
+        rotatedK = torch.stack([rotatedKeven, rotatedKodd], dim=-1).flatten(-2)
+        return rotatedQ, rotatedK
 
     def compute(self, x):
-        # compute Q,K,V at once
+        # compute Q,K,V at once, they are in shape of [batchSize, dimEmb, dimEmb]
         query = self.wQuery(x)
         key = self.wKey(x)
         value = self.wValue(x)
@@ -194,6 +223,8 @@ class Attention:
         queries = query.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
         keys = key.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
         values = value.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
+        # use RoPE to understand relative position of tokens
+        queries, keys = self.applyRoPE(queries, keys, inputLen)
         # compute Attention(Q,K,V) = softmax(mask(Q@K^T / sqrt(d_k))) @ V
         #
         # attention socre means which tokens are most relevant to current token
@@ -223,8 +254,8 @@ class Attention:
 
 
 class Transformer:
-    def __init__(self, config):
-        self.attn = Attention(config)
+    def __init__(self, config, cos, sin):
+        self.attn = Attention(config, cos, sin)
         self.norm1 = Normalization(config)
         self.norm2 = Normalization(config)
         self.ffn = FeedForward(config)
@@ -260,8 +291,9 @@ class SmallGPT:
         )
         self.tokenizer = HuggingFaceTokenizer()
         self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.vocabSize(), dimEmb)
-        self.posEmbedding = torch.nn.Embedding(config["maxWindowSize"], dimEmb)
-        self.transformers = [Transformer(config) for _ in range(config["numLayer"])]
+        dimHead = dimEmb // config["numHead"]
+        cos, sin = self.initRoPE(config["maxWindowSize"], dimHead)
+        self.transformers = [Transformer(config, cos, sin) for _ in range(config["numLayer"])]
         self.finalNorm = Normalization(config)
         self.out = torch.nn.Linear(dimEmb, self.tokenizer.vocabSize(), bias=False)
         self.to(self.device)
@@ -269,9 +301,7 @@ class SmallGPT:
         self.dataloader = DataLoader(config, tokenizer=self.tokenizer)
 
     def parameters(self):
-        params = list(self.tokenEmbedding.parameters()) + list(
-            self.posEmbedding.parameters()
-        )
+        params = list(self.tokenEmbedding.parameters())
         for t in self.transformers:
             params += t.parameters()
         params += self.finalNorm.parameters()
@@ -281,16 +311,23 @@ class SmallGPT:
     def to(self, device):
         self.device = device
         self.tokenEmbedding.to(device)
-        self.posEmbedding.to(device)
         for t in self.transformers:
             t.to(device)
         self.finalNorm.to(device)
         self.out.to(device)
 
+    def initRoPE(self, maxWindowSize, dimHead):
+        # freq = 10000 ^ (-2 * i / dimHead), where i is in [0, 1,..., dimHead//2]
+        i = torch.arange(start=0, end=dimHead//2, device=self.device)
+        freq = 10000.0 ** (-2 * i / dimHead)
+        pos = torch.arange(maxWindowSize, device=self.device)
+        theta = torch.outer(pos, freq)
+        sin = torch.sin(theta)
+        cos = torch.cos(theta)
+        return cos, sin
+
     def compute(self, input):
-        # attach the token embeddings with the position sequence [0,1,2,...]
-        pos = torch.arange(input.shape[1], device=self.device)
-        x = self.tokenEmbedding(input) + self.posEmbedding(pos)
+        x = self.tokenEmbedding(input)
         for transformer in self.transformers:
             x = transformer.compute(x)
         x = self.finalNorm.compute(x)
