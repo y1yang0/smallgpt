@@ -4,81 +4,21 @@ A minimal GPT implementation from scratch for learning purposes.
 
 # Quick Start
 
+**Install dependencies**: 
+```
+$ pip install -r requirements.txt
+```
+**Train the tokenizer**:
+```
+python tokenizer.py train
+```
+
+**Train the model**:
 ```
 python smallgpt.py train
 ```
 
-Train the model and save the weights to `smallgpt.bin`.
-
+**Supervised Fine-tuning**:
 ```
-python smallgpt.py predict
-```
-
-Predict the (given sentence's) next token and print the result.
-
-## Model Architecture
-
-```
-                    ┌─────────────────────┐
-                    │    Input Tokens      │
-                    │     (seq_len,)       │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │  Token Embedding     │
-                    │   (50257, 1024)      │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │ Position Embedding   │
-                    │    (1024, 1024)      │
-                    └──────────┬──────────┘
-                               │
-                        tok_emb + pos_emb
-                               │
-          ┌────────────────────▼────────────────────┐
-          │          Transformer Block × 2          │
-          │                                         │
-          │    ┌─────────────────────────────┐      │
-          │    │  LayerNorm 1    (1024,)     │      │
-          │    └──────────────┬──────────────┘      │
-          │                   │                     │
-          │    ┌──────────────▼──────────────┐      │
-          │    │  Attention                  │      │
-     ┌────┤    │  Q,K,V: (1024, 1024)       │      │
-     │    │    └──────────────┬──────────────┘      │
-     │    │                   │                     │
-  residual│              ⊕ ◄──┘ + x                 │
-     │    │                   │                     │
-     └────┤    ┌──────────────▼──────────────┐      │
-          │    │  LayerNorm 2    (1024,)     │      │
-          │    └──────────────┬──────────────┘      │
-          │                   │                     │
-          │    ┌──────────────▼──────────────┐      │
-     ┌────┤    │  FeedForward                │      │
-     │    │    │  (1024 → 4096 → 1024)       │      │
-  residual│    └──────────────┬──────────────┘      │
-     │    │                   │                     │
-     └────┤              ⊕ ◄──┘ + x                 │
-          │                   │                     │
-          └───────────────────┼─────────────────────┘
-                              │
-                   ┌──────────▼──────────┐
-                   │  Final LayerNorm    │
-                   │     (1024,)         │
-                   └──────────┬──────────┘
-                              │
-                   ┌──────────▼──────────┐
-                   │   Output Linear     │
-                   │  (1024, 50257)      │
-                   └──────────┬──────────┘
-                              │
-                   ┌──────────▼──────────┐
-                   │      Logits         │
-                   │  (seq_len, 50257)   │
-                   └──────────┬──────────┘
-                              │
-                   ┌──────────▼──────────┐
-                   │  argmax → Next Token│
-                   └─────────────────────┘
+python tuning.py
 ```

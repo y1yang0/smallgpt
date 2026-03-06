@@ -1,26 +1,28 @@
 # Copyright (c) 2026 yyang. All rights reserved.
 from tokenizers import Tokenizer
+from typing_extensions import override
 from torch.nn import functional as functional
 import tiktoken
 import torch
-import glob, os, time, random, sys
-
-config = {
-    "dataset": "data/small", # Jinyong's 15 novels
-    "dimEmb": 384,
-    "numLayer": 8,
-    "numHead": 6,
-    "maxWindowSize": 512,
-    "dropoutRate": 0.3,
-    "learningRate": 3e-4,
-    "numEpoch": 10,
-    "batchSize": 32,
-    "trainDataRatio": 0.9,
-    "temperature": 0.9,
-    "topP": 0.9
-}
+import glob, os, time, random, sys, json
 
 isTraining = True
+
+def createModelConfig():
+    config = {
+        "dimEmb": 384,
+        "numLayer": 8,
+        "numHead": 6,
+        "maxWindowSize": 512,
+        "dropoutRate": 0.3,
+        "learningRate": 3e-4,
+        "numEpoch": 10,
+        "batchSize": 32,
+        "trainDataRatio": 0.9,
+        "temperature": 0.9,
+        "topP": 0.9
+    }
+    return config
 
 # My first learned tokenizer
 class TiktokenTokenizer:
@@ -52,29 +54,34 @@ class HuggingFaceTokenizer:
     def vocabSize(self):
         return self.tokenizer.get_vocab_size()
 
+# Pretrain DataLoader
 class DataLoader:
     def __init__(self, config, tokenizer):
         self.maxWindowSize = config["maxWindowSize"]
         self.batchSize = config["batchSize"]
+        self.trainDataRatio = config["trainDataRatio"]
         self.tokenizer = tokenizer
         self.numTokens = 0
-        self.trainBatches, self.valBatches = self.loadDataBatch(config["trainDataRatio"])
+        self.trainBatches = None
+        self.valBatches = None
 
-    def loadDataBatch(self, trainDataRatio):
+    def loadDataset(self):
         # all books concatenated into a single string and split then into chunks
         # of maxWindowSize, each chunk is a (input, target) pair
         dataset = []
-        files = glob.glob(os.path.join(config["dataset"], "*.txt"))
+        files = glob.glob(os.path.join("data/pretrain", "*.txt"))
         for path in files:
             with open(path, "r", encoding="utf-8") as f:
                 tokens = torch.tensor(self.tokenizer.encode(f.read()))
-                self.numTokens += len(tokens)
+                self.numTokens += tokens.numel()
                 for i in range(0, len(tokens) - 1, self.maxWindowSize):
                     chunk = tokens[i : i + self.maxWindowSize + 1]
                     if len(chunk) != self.maxWindowSize + 1:
                         continue  # drop the last unaligned chunk
                     dataset.append((chunk[:-1], chunk[1:]))
-
+        return dataset
+       
+    def packToBatch(self, dataset):
         # pack the dataset into smaller batches, i.e.
         # [(input, target), (input1, target1), ...] =>
         # batch1: [input, input1, ...], [target, target1, ...]
@@ -89,24 +96,80 @@ class DataLoader:
             inputBatch = torch.stack(inputBatch)
             targetBatch = torch.stack(targetBatch)
             batches.append((inputBatch, targetBatch))
+        return batches
 
+    def splitTrainVal(self, batches, trainDataRatio):
         # split dataset into training set and validation set
         random.shuffle(batches)
         splitIdx = int(len(batches) * trainDataRatio)
         trainBatches = batches[:splitIdx]
         valBatches = batches[splitIdx:]
         return trainBatches, valBatches
+    
+    def load(self):
+        dataset = self.loadDataset()
+        batches = self.packToBatch(dataset)
+        t,v = self.splitTrainVal(batches, self.trainDataRatio)
+        self.trainBatches, self.valBatches = t, v
+        return self.trainBatches, self.valBatches
 
     def numBatches(self):
         return len(self.trainBatches) + len(self.valBatches)
 
     def getTrainBatches(self):
+        assert self.trainBatches is not None, "why not otherwise"
         # shuffle the dataset every epoch to prevent model from being overfitted
         random.shuffle(self.trainBatches)
         return self.trainBatches
 
     def getValBatches(self):
+        assert self.valBatches is not None, "why not otherwise"
         return self.valBatches
+
+# Supervised Fine-tuning DataLoader
+class SFTDataLoader(DataLoader):
+    def __init__(self, config, tokenizer):
+        # Skip DataLoader.__init__ to avoid loading pretrain data
+        super().__init__(config, tokenizer)
+
+    @override
+    def loadDataset(self):
+        # all books concatenated into a single string and split then into chunks
+        # of maxWindowSize, each chunk is a (input, target) pair
+        dataset = []
+        files = glob.glob(os.path.join("data/sft/jinyong", "*.jsonl"))
+        endOfBook = "<|endofbook|>"
+        for path in files:
+            with open(path, "r", encoding="utf-8") as jsonl:
+                lines = jsonl.readlines()
+                for line in lines:
+                    data = json.loads(line)
+                    question = f"问: {data['instruction']} 答:"
+                    answer = f"{data['output']}{endOfBook}"
+                    questionIds = self.tokenizer.encode(question)
+                    answerIds = self.tokenizer.encode(answer)
+                    tokenIds = questionIds + answerIds
+                    lenMaxWindow = self.maxWindowSize + 1
+
+                    # drop this sft line if it's too long
+                    if len(tokenIds) > lenMaxWindow:
+                        continue
+                    lenPad = lenMaxWindow - len(tokenIds)
+                    # pad tokens to maxWindowSize
+                    # endOfBook is guaranteed to be a special token
+                    endOfBookId = self.tokenizer.encode(endOfBook)[0]
+                    tokenIds.extend([endOfBookId] * lenPad)
+
+                    # cross-entropy ignores -100, so mask question
+                    tokens = torch.tensor(tokenIds, dtype=torch.long)
+                    self.numTokens += tokens.numel()
+                    # target = masked question + answer + padding
+                    target = torch.tensor(
+                        [-100] * len(questionIds) + answerIds + [-100] * lenPad, 
+                        dtype=torch.long
+                    )
+                    dataset.append((tokens[:-1], target[1:]))
+        return dataset
 
 class Normalization:
     def __init__(self, config):
@@ -283,7 +346,7 @@ class Transformer:
 
 
 class SmallGPT:
-    def __init__(self, config):
+    def __init__(self, config, tuning=False):
         torch.manual_seed(0xCAFEBABE)
         dimEmb = config["dimEmb"]
         self.config = config
@@ -301,7 +364,12 @@ class SmallGPT:
         self.out = torch.nn.Linear(dimEmb, self.tokenizer.vocabSize(), bias=False)
         self.to(self.device)
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=config["learningRate"])
-        self.dataloader = DataLoader(config, tokenizer=self.tokenizer)
+        if tuning:
+            self.dataloader = SFTDataLoader(config, tokenizer=self.tokenizer)
+            self.dataloader.load()
+        else:
+            self.dataloader = DataLoader(config, tokenizer=self.tokenizer)
+            self.dataloader.load()
 
     def parameters(self):
         params = list(self.tokenEmbedding.parameters())
@@ -351,7 +419,7 @@ class SmallGPT:
         print(f"@@ SmallGPT Configuration:")
         print(f"@@    Device: {self.device}")
         print(f"@@    Model Parameters: {totalParams}")
-        print(f"@@    Model Config: {config}")
+        print(f"@@    Model Config: {self.config}")
         print(f"@@    Tokenizer: {self.tokenizer.__class__.__name__}")
         print(f"@@    Tokenizer VocabSize: {self.tokenizer.vocabSize()}")
         print(f"@@    Dataset Batches: {self.dataloader.numBatches()}")
@@ -442,8 +510,12 @@ class SmallGPT:
         print(f"@@ Output: {self.tokenizer.decode(tokenIds)}")
 
 
-def train(model, numEpoch):
-    for epoch in range(numEpoch):
+def train():
+    print("@@ SmallGPT Training...")
+    config = createModelConfig()
+    model = SmallGPT(config)
+    model.printConfig()
+    for epoch in range(config["numEpoch"]):
         # train the model and return last training loss
         start = time.time()
         avgTrainLoss = model.train()
@@ -454,7 +526,10 @@ def train(model, numEpoch):
         print(f"\r@@ Epoch: {epoch} Elapsed: {end-start:.2f}s TrainLoss: {avgTrainLoss:.4f} ValLoss: {avgValLoss:.4f}\n", end="", flush=True)
         model.predict("杨过和小龙女在")
 
-def predict(model):
+def predict():
+    print("@@ SmallGPT Predicting...")
+    config = createModelConfig()
+    model = SmallGPT(config)
     model.loadWeights("smallgpt.bin")
     model.predict("杨过和小龙女在")
     model.predict("神雕大侠")
@@ -468,10 +543,33 @@ def predict(model):
     model.predict("少林寺")
     model.predict("降龙十八掌")
 
-smallGPT = SmallGPT(config)
+def tuning():
+    print("@@ SmallGPT Tuning...")
+    config = createModelConfig()
+    config["learningRate"] = 3e-5
+    model = SmallGPT(config, tuning=True)
+    model.printConfig()
+    model.loadWeights("smallgpt.bin")
+    for epoch in range(config["numEpoch"]):
+        start = time.time()
+        avgTrainLoss = model.train()
+        model.saveWeights("smallgpt_tuning.bin")
+        # validate the model and return average loss
+        avgValLoss = model.validate()
+        end = time.time()
+        print(f"\r@@ Epoch: {epoch} Elapsed: {end-start:.2f}s TrainLoss: {avgTrainLoss:.4f} ValLoss: {avgValLoss:.4f}\n", end="", flush=True)
+        model.predict("问: 杨过是谁？ 答:")
 
-if len(sys.argv) > 1 and sys.argv[1] == "train":
-    smallGPT.printConfig()
-    train(smallGPT, config["numEpoch"])
-else:
-    predict(smallGPT)
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+        if mode == "train":
+            train()
+        elif mode == "predict":
+            predict()
+        elif mode == "tuning":
+            tuning()
+        else:
+            print(f"Unknown mode: {mode}")
+    else:
+        print("Usage: python smallgpt.py <train|predict|tuning>")
