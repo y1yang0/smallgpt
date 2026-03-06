@@ -1,8 +1,6 @@
-# SmallGPT
+![](logo.svg)
 
-A minimal GPT implementation from scratch for learning purposes.
-
-# Quick Start
+SmallGPT is a modernized minimal GPT implementation from scratch for learning purposes.
 
 **Install dependencies**: 
 ```

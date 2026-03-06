@@ -13,7 +13,7 @@ trainer = BpeTrainer(
 
 
 def trainTokenizer():
-    dataDir = "data/small"
+    dataDir = "data/pretrain"
     files = glob.glob(os.path.join(dataDir, "*.txt"))
     print(f"Training tokenizer with {files} files")
     tokenizer.train(files, trainer)

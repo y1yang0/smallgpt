@@ -16,7 +16,7 @@ def createModelConfig():
         "maxWindowSize": 512,
         "dropoutRate": 0.3,
         "learningRate": 3e-4,
-        "numEpoch": 10,
+        "numEpoch": 16,
         "batchSize": 32,
         "trainDataRatio": 0.9,
         "temperature": 0.9,
@@ -46,7 +46,11 @@ class HuggingFaceTokenizer:
         self.tokenizer = Tokenizer.from_file(path)
 
     def decode(self, ids):
-        return self.tokenizer.decode(ids)
+        sentence = ""
+        for d in ids:
+            text = self.tokenizer.decode([d])
+            sentence += text
+        return sentence
 
     def encode(self, text):
         return self.tokenizer.encode(text).ids
@@ -173,7 +177,7 @@ class SFTDataLoader(DataLoader):
 
 class Normalization:
     def __init__(self, config):
-        self.norm = torch.nn.LayerNorm(config["dimEmb"])
+        self.norm = torch.nn.RMSNorm(config["dimEmb"])
 
     def compute(self, x):
         return self.norm(x)
