@@ -2,3 +2,5 @@ smallgpt.bin
 .vscode
 *.html
 *.htm
+__pycache__
+.qoder

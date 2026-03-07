@@ -6,17 +6,8 @@ SmallGPT is a modernized minimal GPT implementation from scratch for learning pu
 ```
 $ pip install -r requirements.txt
 ```
-**Train the tokenizer**:
-```
-python tokenizer.py train
-```
 
-**Train the model**:
+**Running SmallGPT**
 ```
-python smallgpt.py train
-```
-
-**Supervised Fine-tuning**:
-```
-python tuning.py
+Usage: python smallgpt.py <train|predict|tuning>
 ```

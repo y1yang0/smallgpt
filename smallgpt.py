@@ -1,12 +1,14 @@
 # Copyright (c) 2026 yyang. All rights reserved.
-from tokenizers import Tokenizer
-from typing_extensions import override
-from torch.nn import functional as functional
-import tiktoken
+import tokenizer
+import dataloader
+from torch.nn import functional
 import torch
-import glob, os, time, random, sys, json
+import glob
+import time
+import sys
 
 isTraining = True
+
 
 def createModelConfig():
     config = {
@@ -16,164 +18,14 @@ def createModelConfig():
         "maxWindowSize": 512,
         "dropoutRate": 0.3,
         "learningRate": 3e-4,
-        "numEpoch": 16,
-        "batchSize": 32,
-        "trainDataRatio": 0.9,
+        "numEpoch": 1,
+        "batchSize": 16,
+        "trainDataRatio": 0.98,
         "temperature": 0.9,
-        "topP": 0.9
+        "topP": 0.9,
     }
     return config
 
-# My first learned tokenizer
-class TiktokenTokenizer:
-    def __init__(self):
-        self.tokenizer = tiktoken.get_encoding("gpt2")
-
-    def decode(self, input):
-        return self.tokenizer.decode(input)
-
-    def encode(self, input):
-        return self.tokenizer.encode(input)
-
-    def vocabSize(self):
-        return self.tokenizer.n_vocab
-
-
-# Self-trained tokenizer for Jinyong-specific dataset, from huggingface/tokenizer
-class HuggingFaceTokenizer:
-    def __init__(self):
-        path = "data/tokenizer.json"
-        self.tokenizer = Tokenizer.from_file(path)
-
-    def decode(self, ids):
-        sentence = ""
-        for d in ids:
-            text = self.tokenizer.decode([d])
-            sentence += text
-        return sentence
-
-    def encode(self, text):
-        return self.tokenizer.encode(text).ids
-
-    def vocabSize(self):
-        return self.tokenizer.get_vocab_size()
-
-# Pretrain DataLoader
-class DataLoader:
-    def __init__(self, config, tokenizer):
-        self.maxWindowSize = config["maxWindowSize"]
-        self.batchSize = config["batchSize"]
-        self.trainDataRatio = config["trainDataRatio"]
-        self.tokenizer = tokenizer
-        self.numTokens = 0
-        self.trainBatches = None
-        self.valBatches = None
-
-    def loadDataset(self):
-        # all books concatenated into a single string and split then into chunks
-        # of maxWindowSize, each chunk is a (input, target) pair
-        dataset = []
-        files = glob.glob(os.path.join("data/pretrain", "*.txt"))
-        for path in files:
-            with open(path, "r", encoding="utf-8") as f:
-                tokens = torch.tensor(self.tokenizer.encode(f.read()))
-                self.numTokens += tokens.numel()
-                for i in range(0, len(tokens) - 1, self.maxWindowSize):
-                    chunk = tokens[i : i + self.maxWindowSize + 1]
-                    if len(chunk) != self.maxWindowSize + 1:
-                        continue  # drop the last unaligned chunk
-                    dataset.append((chunk[:-1], chunk[1:]))
-        return dataset
-       
-    def packToBatch(self, dataset):
-        # pack the dataset into smaller batches, i.e.
-        # [(input, target), (input1, target1), ...] =>
-        # batch1: [input, input1, ...], [target, target1, ...]
-        # batch2: [inputN, inputN+1, ...], [targetN, targetN+1, ...]
-        batches = []
-        for idx in range(0, len(dataset), self.batchSize):
-            # [(input, target), (input1, target1), ...]
-            batch = dataset[idx : idx + self.batchSize]
-            # [input, input1, ...], [target, target1, ...]
-            inputBatch, targetBatch = zip(*batch)
-            # tensor([input, input1, ...]), tensor([target, target1, ...])
-            inputBatch = torch.stack(inputBatch)
-            targetBatch = torch.stack(targetBatch)
-            batches.append((inputBatch, targetBatch))
-        return batches
-
-    def splitTrainVal(self, batches, trainDataRatio):
-        # split dataset into training set and validation set
-        random.shuffle(batches)
-        splitIdx = int(len(batches) * trainDataRatio)
-        trainBatches = batches[:splitIdx]
-        valBatches = batches[splitIdx:]
-        return trainBatches, valBatches
-    
-    def load(self):
-        dataset = self.loadDataset()
-        batches = self.packToBatch(dataset)
-        t,v = self.splitTrainVal(batches, self.trainDataRatio)
-        self.trainBatches, self.valBatches = t, v
-        return self.trainBatches, self.valBatches
-
-    def numBatches(self):
-        return len(self.trainBatches) + len(self.valBatches)
-
-    def getTrainBatches(self):
-        assert self.trainBatches is not None, "why not otherwise"
-        # shuffle the dataset every epoch to prevent model from being overfitted
-        random.shuffle(self.trainBatches)
-        return self.trainBatches
-
-    def getValBatches(self):
-        assert self.valBatches is not None, "why not otherwise"
-        return self.valBatches
-
-# Supervised Fine-tuning DataLoader
-class SFTDataLoader(DataLoader):
-    def __init__(self, config, tokenizer):
-        # Skip DataLoader.__init__ to avoid loading pretrain data
-        super().__init__(config, tokenizer)
-
-    @override
-    def loadDataset(self):
-        # all books concatenated into a single string and split then into chunks
-        # of maxWindowSize, each chunk is a (input, target) pair
-        dataset = []
-        files = glob.glob(os.path.join("data/sft/jinyong", "*.jsonl"))
-        endOfBook = "<|endofbook|>"
-        for path in files:
-            with open(path, "r", encoding="utf-8") as jsonl:
-                lines = jsonl.readlines()
-                for line in lines:
-                    data = json.loads(line)
-                    question = f"问: {data['instruction']} 答:"
-                    answer = f"{data['output']}{endOfBook}"
-                    questionIds = self.tokenizer.encode(question)
-                    answerIds = self.tokenizer.encode(answer)
-                    tokenIds = questionIds + answerIds
-                    lenMaxWindow = self.maxWindowSize + 1
-
-                    # drop this sft line if it's too long
-                    if len(tokenIds) > lenMaxWindow:
-                        continue
-                    lenPad = lenMaxWindow - len(tokenIds)
-                    # pad tokens to maxWindowSize
-                    # endOfBook is guaranteed to be a special token
-                    endOfBookId = self.tokenizer.encode(endOfBook)[0]
-                    tokenIds.extend([endOfBookId] * lenPad)
-
-                    # cross-entropy ignores -100, so mask question
-                    tokens = torch.tensor(tokenIds, dtype=torch.long)
-                    self.numTokens += tokens.numel()
-                    # target = masked question + answer + padding
-                    target = torch.tensor(
-                        [-100] * len(questionIds) + answerIds + [-100] * lenPad, 
-                        dtype=torch.long
-                    )
-                    dataset.append((tokens[:-1], target[1:]))
-        return dataset
 
 class Normalization:
     def __init__(self, config):
@@ -249,12 +101,12 @@ class Attention:
         self.wOut.to(device)
         self.dropout.to(device)
         self.cos = self.cos.to(device)
-        self.sin =self.sin.to(device)
-    
+        self.sin = self.sin.to(device)
+
     def applyRoPE(self, q, k, inputLen):
         # q and k are (batchSize, numHead, inputLen, dimHead)
         # cos and sin are (inputLen, dimHead//2)
-        cos, sin = self.cos[:inputLen,:], self.sin[:inputLen,:]
+        cos, sin = self.cos[:inputLen, :], self.sin[:inputLen, :]
         # cos and sin are (1, 1, inputLen, dimHead//2)
         # now they are matched with Q and K
         cos = cos.unsqueeze(0).unsqueeze(0)
@@ -266,10 +118,10 @@ class Attention:
         # q0*cos(θ) - q1*sin(θ)
         # q1*cos(θ) + q0*sin(θ)
         # ... and so on
-        rotatedQeven = qeven* cos - qodd * sin
-        rotatedQodd = qodd* cos + qeven * sin
-        rotatedKeven = keven* cos - kodd * sin
-        rotatedKodd = kodd* cos + keven * sin
+        rotatedQeven = qeven * cos - qodd * sin
+        rotatedQodd = qodd * cos + qeven * sin
+        rotatedKeven = keven * cos - kodd * sin
+        rotatedKodd = kodd * cos + keven * sin
         # rotatedQ and rotatedK are (batchSize, numHead, inputLen, dimHead//2, 2)
         # so I should flatten the last dimension to get back to
         # (batchSize, numHead, inputLen, dimHead)
@@ -289,9 +141,12 @@ class Attention:
         # and transpose(1,2) dimensions to get the desired shape
         batchSize, inputLen, dimEmb = x.shape
         dimHead = dimEmb // self.numHead
-        queries = query.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
-        keys = key.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
-        values = value.view(batchSize, inputLen, self.numHead, dimHead).transpose(1, 2)
+        queries = query.view(batchSize, inputLen,
+                             self.numHead, dimHead).transpose(1, 2)
+        keys = key.view(batchSize, inputLen, self.numHead,
+                        dimHead).transpose(1, 2)
+        values = value.view(batchSize, inputLen,
+                            self.numHead, dimHead).transpose(1, 2)
         # use RoPE to understand relative position of tokens
         queries, keys = self.applyRoPE(queries, keys, inputLen)
         # compute Attention(Q,K,V) = softmax(mask(Q@K^T / sqrt(d_k))) @ V
@@ -318,7 +173,8 @@ class Attention:
         # how to combine the information from all heads
         #   out(batchSize, numHead, inputLen, dimHead)
         #   = out(batchSize, inputLen, dimEmb)
-        out = out.transpose(1, 2).contiguous().view(batchSize, inputLen, dimEmb)
+        out = out.transpose(1, 2).contiguous().view(
+            batchSize, inputLen, dimEmb)
         return self.wOut(out)
 
 
@@ -349,8 +205,8 @@ class Transformer:
         )
 
 
-class SmallGPT:
-    def __init__(self, config, tuning=False):
+class Model:
+    def __init__(self, config, vocabSize):
         torch.manual_seed(0xCAFEBABE)
         dimEmb = config["dimEmb"]
         self.config = config
@@ -359,21 +215,18 @@ class SmallGPT:
             if torch.cuda.is_available()
             else "mps" if torch.backends.mps.is_available() else "cpu"
         )
-        self.tokenizer = HuggingFaceTokenizer()
-        self.tokenEmbedding = torch.nn.Embedding(self.tokenizer.vocabSize(), dimEmb)
+        self.vocabSize = vocabSize
+        self.tokenEmbedding = torch.nn.Embedding(vocabSize, dimEmb)
         dimHead = dimEmb // config["numHead"]
         cos, sin = self.initRoPE(config["maxWindowSize"], dimHead)
-        self.transformers = [Transformer(config, cos, sin) for _ in range(config["numLayer"])]
+        self.transformers = [
+            Transformer(config, cos, sin) for _ in range(config["numLayer"])
+        ]
         self.finalNorm = Normalization(config)
-        self.out = torch.nn.Linear(dimEmb, self.tokenizer.vocabSize(), bias=False)
+        self.out = torch.nn.Linear(dimEmb, vocabSize, bias=False)
         self.to(self.device)
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=config["learningRate"])
-        if tuning:
-            self.dataloader = SFTDataLoader(config, tokenizer=self.tokenizer)
-            self.dataloader.load()
-        else:
-            self.dataloader = DataLoader(config, tokenizer=self.tokenizer)
-            self.dataloader.load()
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(), lr=config["learningRate"])
 
     def parameters(self):
         params = list(self.tokenEmbedding.parameters())
@@ -393,7 +246,7 @@ class SmallGPT:
 
     def initRoPE(self, maxWindowSize, dimHead):
         # freq = 10000 ^ (-2 * i / dimHead), where i is in [0, 1,..., dimHead//2]
-        i = torch.arange(start=0, end=dimHead//2, device=self.device)
+        i = torch.arange(start=0, end=dimHead // 2, device=self.device)
         freq = 10000.0 ** (-2 * i / dimHead)
         pos = torch.arange(maxWindowSize, device=self.device)
         theta = torch.outer(pos, freq)
@@ -402,11 +255,35 @@ class SmallGPT:
         return cos, sin
 
     def compute(self, input):
+        input = input.to(self.device)
+        # Transformer moment
         x = self.tokenEmbedding(input)
         for transformer in self.transformers:
             x = transformer.compute(x)
         x = self.finalNorm.compute(x)
         return self.out(x)
+
+    def loss(self, output, target, backward=True):
+        target = target.to(self.device)
+        # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
+        # it means every sample has a prob distribution over all classes as output
+        # and a single class as target
+        # while I have out(batchSize, inputLen(numSample), vocabSize(numClass))
+        # and target(batchSize, inputLen(numSample)), so I need to flatten them
+        # as out(batchSize * inputLen, vocabSize) and target(batchSize * inputLen)
+        output = output.view(
+            output.shape[0] * output.shape[1], output.shape[2])
+        target = target.view(target.shape[0] * target.shape[1])
+        loss = functional.cross_entropy(output, target)
+        lossVal = loss.item()
+        # backward pass to update weights
+        if backward:
+            loss.backward()
+            # prevent the exploding gradient problem
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        return lossVal
 
     def saveWeights(self, path):
         torch.save([p.data.cpu() for p in self.parameters()], path)
@@ -420,17 +297,13 @@ class SmallGPT:
 
     def printConfig(self):
         totalParams = sum(p.numel() for p in self.parameters())
-        print(f"@@ SmallGPT Configuration:")
+        print(f"@@ Model Configuration:")
         print(f"@@    Device: {self.device}")
         print(f"@@    Model Parameters: {totalParams}")
         print(f"@@    Model Config: {self.config}")
-        print(f"@@    Tokenizer: {self.tokenizer.__class__.__name__}")
-        print(f"@@    Tokenizer VocabSize: {self.tokenizer.vocabSize()}")
-        print(f"@@    Dataset Batches: {self.dataloader.numBatches()}")
-        print(f"@@    Dataset Tokens: {self.dataloader.numTokens}")
-        print(f"@@    Dataset WindowSize: {self.dataloader.maxWindowSize}")
+        print(f"@@    VocabSize: {self.vocabSize}")
 
-    def topP(self, logits, topP=0.9):
+    def topP(self, logits):
         logits, idx = torch.sort(logits, descending=True)
         # [0.5,0.3,0.1,0.1]
         probs = torch.softmax(logits, dim=-1)
@@ -450,8 +323,9 @@ class SmallGPT:
         return filtered
 
     @torch.no_grad()
-    def nextToken(self, input):
-        logits = self.compute(torch.stack([input]))
+    def nextToken(self, tokens):
+        t = torch.tensor(tokens, dtype=torch.long, device=self.device)
+        logits = self.compute(torch.stack([t]))
         # first batch, last tokens, all logits
         logits = logits[0, -1, :] / self.config["temperature"]
         logits = self.topP(logits)
@@ -459,121 +333,89 @@ class SmallGPT:
         nextTokenId = torch.multinomial(probs, num_samples=1)
         return nextTokenId.item()
 
-    @torch.no_grad()
+
+class SmallGPT:
+    def __init__(self, config):
+        self.config = config
+        self.tokenizer = tokenizer.HuggingFaceTokenizer()
+        self.model = Model(config, vocabSize=self.tokenizer.vocabSize())
+        # use simple data loader to load Jinyong's novels all at once
+        # it should be replaced with large data loader for streaming
+        # files = glob.glob("data/pretrain/*.txt")
+        # self.dataloader = dataloader.SimpleDataLoader(
+        #     self.config, self.tokenizer, files)
+        files = glob.glob("data/more/*.txt")
+        trainDataRatio = config["trainDataRatio"]
+        trainFiles = files[:int(len(files)*trainDataRatio)]
+        valFiles = files[int(len(files)*trainDataRatio):]
+        self.dataloader = dataloader.LargeDataLoader(config,self.tokenizer,trainFiles,valFiles)
+
     def validate(self):
         global isTraining
         isTraining = False
         totalLoss = 0.0
-        valBatches = self.dataloader.getValBatches()
-        for (idx, (input, target)) in enumerate(valBatches):
-            input, target = input.to(self.device), target.to(self.device)
-            output = self.compute(input)
-            output = output.view(output.shape[0] * output.shape[1], output.shape[2])
-            target = target.view(target.shape[0] * target.shape[1])
-            loss = functional.cross_entropy(output, target)
-            totalLoss += loss.item()
-        return totalLoss / len(valBatches)
+        totalBatch = 0
+        for (input, target) in self.dataloader.nextValBatch():
+            # compute loss without updating weights
+            output = self.model.compute(input)
+            loss = self.model.loss(output, target, backward=False)
+            totalLoss += loss
+            totalBatch += 1
+        return totalLoss / totalBatch
 
-    def train(self):
-        global isTraining
-        isTraining = True
-        totalLoss = 0.0
-        trainBatches = self.dataloader.getTrainBatches()
-        for (idx, (input, target)) in enumerate(trainBatches):
-            input, target = input.to(self.device), target.to(self.device)
-            output = self.compute(input)
-            # cross-entrypy loss asks for (numSample, numClass) and (numSample) as input
-            # it means every sample has a prob distribution over all classes as output
-            # and a single class as target
-            # while I have out(batchSize, inputLen(numSample), vocabSize(numClass))
-            # and target(batchSize, inputLen(numSample)), so I need to flatten them
-            # as out(batchSize * inputLen, vocabSize) and target(batchSize * inputLen)
-            output = output.view(output.shape[0] * output.shape[1], output.shape[2])
-            target = target.view(target.shape[0] * target.shape[1])
-            loss = functional.cross_entropy(output, target)
-            totalLoss += loss.item()
-            loss.backward()
-            # prevent the exploding gradient problem
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-        return totalLoss / len(trainBatches)
-    
+    def train(self, modelPath="smallgpt.bin"):
+        for epoch in range(self.config["numEpoch"]):
+            start = time.time()
+            totalLoss = 0.0
+            totalBatch = 0
+            for (input, target) in self.dataloader.nextTrainBatch():
+                global isTraining
+                isTraining = True
+                output = self.model.compute(input)
+                loss = self.model.loss(output, target, backward=True)
+                totalLoss += loss
+                totalBatch += 1
+                if totalBatch % 100 == 0:
+                    avgValLoss = self.validate()
+                    print(
+                        f"@@ Progress: {self.dataloader.progress():.2f}% Batch: {totalBatch} TrainLoss: {totalLoss/totalBatch:.4f} ValLoss: {avgValLoss:.4f}")
+            end = time.time()
+            self.model.saveWeights(modelPath)
+            print(f"@@ Epoch: {epoch} Elapsed: {end-start:.2f}s")
+
+    def tuning(self):
+        self.config["learningRate"] = 3e-5
+        self.model.printConfig()
+        self.dataloader = dataloader.SFTDataLoader(self.config, self.tokenizer)
+        self.train("smallgpt_tuning.bin")
+
     @torch.no_grad()
-    def predict(self, text, maxTokens=30):
+    def predict(self, sentences, maxTokens=30):
         global isTraining
         isTraining = False
-        print(f"@@ Input: {text}")
-        tokenIds = self.tokenizer.encode(text)
-        for _ in range(maxTokens):
-            window = tokenIds[-self.dataloader.maxWindowSize:]
-            t = self.nextToken(
-                torch.tensor(window, dtype=torch.long, device=self.device)
-            )
-            tokenIds.append(t)
-        print(f"@@ Output: {self.tokenizer.decode(tokenIds)}")
+        self.model.loadWeights("smallgpt.bin")
+        for sentence in sentences:
+            tokens = self.tokenizer.encode(sentence)
+            for _ in range(maxTokens):
+                tokens = tokens[-self.config["maxWindowSize"]:]
+                tokens.append(self.model.nextToken(tokens))
+            output = self.tokenizer.decode(tokens)
+            output = output[len(sentence):]
+            print(f"@@ Predict: {sentence}[{output}]")
 
-
-def train():
-    print("@@ SmallGPT Training...")
-    config = createModelConfig()
-    model = SmallGPT(config)
-    model.printConfig()
-    for epoch in range(config["numEpoch"]):
-        # train the model and return last training loss
-        start = time.time()
-        avgTrainLoss = model.train()
-        model.saveWeights("smallgpt.bin")
-        # validate the model and return average loss
-        avgValLoss = model.validate()
-        end = time.time()
-        print(f"\r@@ Epoch: {epoch} Elapsed: {end-start:.2f}s TrainLoss: {avgTrainLoss:.4f} ValLoss: {avgValLoss:.4f}\n", end="", flush=True)
-        model.predict("杨过和小龙女在")
-
-def predict():
-    print("@@ SmallGPT Predicting...")
-    config = createModelConfig()
-    model = SmallGPT(config)
-    model.loadWeights("smallgpt.bin")
-    model.predict("杨过和小龙女在")
-    model.predict("神雕大侠")
-    model.predict("韦小宝和双儿")
-    model.predict("围攻光明顶")
-    model.predict("郭靖和黄蓉")
-    model.predict("张无忌")
-    model.predict("令狐冲说")
-    model.predict("华山论剑")
-    model.predict("桃花岛上")
-    model.predict("少林寺")
-    model.predict("降龙十八掌")
-
-def tuning():
-    print("@@ SmallGPT Tuning...")
-    config = createModelConfig()
-    config["learningRate"] = 3e-5
-    model = SmallGPT(config, tuning=True)
-    model.printConfig()
-    model.loadWeights("smallgpt.bin")
-    for epoch in range(config["numEpoch"]):
-        start = time.time()
-        avgTrainLoss = model.train()
-        model.saveWeights("smallgpt_tuning.bin")
-        # validate the model and return average loss
-        avgValLoss = model.validate()
-        end = time.time()
-        print(f"\r@@ Epoch: {epoch} Elapsed: {end-start:.2f}s TrainLoss: {avgTrainLoss:.4f} ValLoss: {avgValLoss:.4f}\n", end="", flush=True)
-        model.predict("问: 杨过是谁？ 答:")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         mode = sys.argv[1]
+        print(f"@@ SmallGPT Mode: {mode}")
+        g = SmallGPT(createModelConfig())
         if mode == "train":
-            train()
+            g.train()
         elif mode == "predict":
-            predict()
+            sentences = ["杨过和小龙女在", "神雕大侠", "韦小宝和双儿", "围攻光明顶",
+                         "郭靖和黄蓉", "张无忌", "令狐冲说", "华山论剑", "桃花岛上", "少林寺", "降龙十八掌"]
+            g.predict(sentences)
         elif mode == "tuning":
-            tuning()
-        else:
-            print(f"Unknown mode: {mode}")
+            g.tuning()
     else:
         print("Usage: python smallgpt.py <train|predict|tuning>")
